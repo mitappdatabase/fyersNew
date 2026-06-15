@@ -29,6 +29,10 @@ from threading import Thread, Lock
 import threading
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
+import hashlib
+import base64
+import hmac
+import struct
 
 # Patch FYERS websocket symbol conversion to handle auth header changes.
 # Some FYERS data endpoints accept raw JWT only, while others may require Bearer prefix.
@@ -190,6 +194,7 @@ from typing import Optional, Tuple, Dict, Any, overload, Literal
 def get_auth_code_automated(app_id: str, secret_key: str, user: str) -> Optional[str]:
     """
     Automatically get auth code using Flask callback server.
+    Updated for FYERS new login flow (after April 1, 2026).
     """
     auth_code_queue = queue.Queue()
 
@@ -214,7 +219,7 @@ def get_auth_code_automated(app_id: str, secret_key: str, user: str) -> Optional
     # Give server time to start
     time.sleep(1)
 
-    # Generate auth URL with correct redirect URI
+    # Generate auth URL with correct redirect URI for new FYERS flow
     session = fyersModel.SessionModel(
         client_id=app_id,
         secret_key=secret_key,
@@ -236,6 +241,144 @@ def get_auth_code_automated(app_id: str, secret_key: str, user: str) -> Optional
         return auth_code
     except queue.Empty:
         log_message(f"[FYERS] Timeout waiting for auth code for {user}")
+        return None
+
+
+def generate_totp(secret_key: str) -> str:
+    """
+    Generate TOTP code for FYERS 2FA authentication.
+    Uses the new TOTP-based authentication flow required after April 1, 2026.
+    """
+    import time
+    
+    # Decode the base32 encoded secret key
+    secret = base64.b32decode(secret_key.upper())
+    
+    # Get current time step (30 second intervals)
+    time_step = int(time.time()) // 30
+    
+    # Pack time step as big-endian 8-byte integer
+    time_bytes = struct.pack('>Q', time_step)
+    
+    # Generate HMAC-SHA256 hash
+    hmac_hash = hmac.new(secret, time_bytes, hashlib.sha256).digest()
+    
+    # Dynamic truncation
+    offset = hmac_hash[-1] & 0x0F
+    truncated = struct.unpack('>I', hmac_hash[offset:offset+4])[0] & 0x7FFFFFFF
+    
+    # Generate 6-digit TOTP code
+    totp_code = truncated % 1000000
+    
+    return f"{totp_code:06d}"
+
+
+def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secret: str = None) -> Optional[Tuple[str, str]]:
+    """
+    New FYERS login flow (after April 1, 2026) using TOTP-based authentication.
+    Returns tuple of (access_token, refresh_token) or None on failure.
+    """
+    try:
+        # Step 1: Create pre-login payload
+        pre_login_url = "https://api-t1.fyers.in/api/v3/validate-pre-login"
+        pre_login_payload = {
+            "fy_id": app_id,
+            "app_type": 2,
+            "device_info": {
+                "device_id": "web",
+                "platform_name": "web",
+                "platform_version": "1.0",
+                "unique_device_id": hashlib.md5(f"{app_id}{user}".encode()).hexdigest()
+            }
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        response = requests.post(pre_login_url, json=pre_login_payload, headers=headers, timeout=15)
+        pre_login_data = response.json()
+        
+        if pre_login_data.get("s") != "ok":
+            log_message(f"[FYERS] Pre-login failed for {user}: {pre_login_data}")
+            return None
+        
+        request_key = pre_login_data.get("request_key")
+        if not request_key:
+            log_message(f"[FYERS] No request_key in pre-login response for {user}")
+            return None
+        
+        # Step 2: Generate TOTP if provided
+        totp_code = None
+        if totp_secret:
+            totp_code = generate_totp(totp_secret)
+            log_message(f"[FYERS] Generated TOTP code for {user}")
+        
+        # Step 3: Send login request with TOTP
+        login_url = "https://api-t1.fyers.in/api/v3/validate-login"
+        login_payload = {
+            "request_key": request_key,
+            "totp": totp_code,
+            "identity_type": "phone",
+            "identifier": user  # This should be the registered phone number or email
+        }
+        
+        response = requests.post(login_url, json=login_payload, headers=headers, timeout=15)
+        login_data = response.json()
+        
+        if login_data.get("s") != "ok":
+            log_message(f"[FYERS] Login failed for {user}: {login_data}")
+            return None
+        
+        # Step 4: Generate auth code using the validated session
+        auth_code_url = "https://api-t1.fyers.in/api/v3/generate-auth-code"
+        auth_code_payload = {
+            "request_key": request_key,
+            "redirect_uri": "http://127.0.0.1:5000/callback"
+        }
+        
+        response = requests.post(auth_code_url, json=auth_code_payload, headers=headers, timeout=15)
+        auth_code_data = response.json()
+        
+        if auth_code_data.get("s") != "ok":
+            log_message(f"[FYERS] Auth code generation failed for {user}: {auth_code_data}")
+            return None
+        
+        auth_code = auth_code_data.get("auth_code")
+        if not auth_code:
+            log_message(f"[FYERS] No auth_code in response for {user}")
+            return None
+        
+        # Step 5: Exchange auth code for access token
+        token_url = "https://api-t1.fyers.in/api/v3/validate-authcode"
+        token_payload = {
+            "grant_type": "authorization_code",
+            "appIdHash": hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest(),
+            "code": auth_code,
+            "redirect_uri": "http://127.0.0.1:5000/callback"
+        }
+        
+        response = requests.post(token_url, json=token_payload, headers=headers, timeout=15)
+        token_data = response.json()
+        
+        if token_data.get("s") != "ok":
+            log_message(f"[FYERS] Token generation failed for {user}: {token_data}")
+            return None
+        
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        
+        if access_token:
+            log_message(f"[FYERS] Successfully generated access token for {user}")
+            return (access_token, refresh_token)
+        else:
+            log_message(f"[FYERS] No access_token in final response for {user}")
+            return None
+            
+    except Exception as e:
+        log_message(f"[FYERS] New login flow error for {user}: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -1398,13 +1541,38 @@ class MultiAccountManager:
                     log_message(f"[LOGIN FAIL] {user} - Missing FYERS secret_key (needed to generate/access token)")
                     return None
 
-                access_token = self._refresh_access_token(cred, cred_path, app_id, secret_key, user)
-                if access_token:
-                    log_message(f"[FYERS] Access token refreshed for {user}")
+                # Try new FYERS login flow first (after April 1, 2026)
+                log_message(f"[FYERS] Attempting new login flow for {user}...")
+                
+                # Get TOTP secret from credentials if available
+                totp_secret = str(cred.get('totp_secret', '')).strip()
+                
+                tokens = get_access_token_new_flow(app_id, secret_key, user, totp_secret if totp_secret else None)
+                
+                if tokens:
+                    access_token, refresh_token = tokens
+                    log_message(f"[FYERS] Access token generated via new flow for {user}")
+                    
+                    # Save the new tokens to the YAML file
+                    if cred_path:
+                        save_cred = raw_cred if nested else cred
+                        if nested:
+                            save_cred['fyers']['fyers_access_token'] = access_token
+                            if refresh_token:
+                                save_cred['fyers']['refresh_token'] = refresh_token
+                        else:
+                            save_cred['fyers_access_token'] = access_token
+                            if refresh_token:
+                                save_cred['refresh_token'] = refresh_token
+                        with open(cred_path, 'w') as f:
+                            yaml.dump(save_cred, f, default_flow_style=False)
+                        log_message(f"[FYERS] New access token saved to {cred_path} for {user}")
+                    else:
+                        log_message(f"[FYERS] Could not find cred file to save token for {user}")
                 else:
-                    # Fall back to manual auth flow if refresh fails
-                    log_message(f"[FYERS] Access token missing for {user}, generating new one...")
-
+                    # Fall back to old auth flow if new flow fails
+                    log_message(f"[FYERS] New login flow failed for {user}, trying old flow...")
+                    
                     try:
                         # Step 1: Get auth code automatically
                         auth_code = get_auth_code_automated(app_id, secret_key, user)
@@ -1461,73 +1629,111 @@ class MultiAccountManager:
 
             # If token is invalid/expired, try refreshing using stored refresh token + pin.
             if secret_key:
-                refreshed = self._refresh_access_token(cred, cred_path, app_id, secret_key, user)
-                if refreshed:
-                    access_token = refreshed
-                    try:
-                        ret = api.login(app_id=app_id, access_token=access_token)
-                        if ret and ret.get('stat') == 'Ok':
-                            log_message(f"[LOGIN OK] {user} (after token refresh)")
-                            return api
-                    except Exception as e:
-                        log_message(f"[LOGIN EXCEPTION AFTER REFRESH] {user}: {e}")
-
-            # If refresh failed or no secret_key, try manual token generation
-            if secret_key:
-                log_message(f"[FYERS] Access token invalid for {user}, generating new one...")
-
-                try:
-                    # Step 1: Get auth code automatically
-                    auth_code = get_auth_code_automated(app_id, secret_key, user)
-                    if not auth_code:
-                        log_message(f"[FYERS] Failed to get auth code for {user}")
-                        return None
-
-                    # Step 2: Generate access token
-                    session = fyersModel.SessionModel(
-                        client_id=app_id,
-                        secret_key=secret_key,
-                        grant_type="authorization_code"
-                    )
-                    session.set_token(auth_code)
-                    token_response = session.generate_token()
-
-                    if not token_response or token_response.get("s") != "ok":
-                        log_message(f"[FYERS] Token generation failed for {user}: {token_response}")
-                        return None
-
-                    access_token = token_response.get("access_token")
-                    if not access_token:
-                        log_message(f"[FYERS] No access_token in response for {user}")
-                        return None
-
-                    # Step 5: Save the new token to the YAML file
+                # First try the new FYERS login flow (after April 1, 2026)
+                log_message(f"[FYERS] Access token invalid for {user}, trying new login flow...")
+                
+                totp_secret = str(cred.get('totp_secret', '')).strip()
+                tokens = get_access_token_new_flow(app_id, secret_key, user, totp_secret if totp_secret else None)
+                
+                if tokens:
+                    access_token, refresh_token = tokens
+                    log_message(f"[FYERS] Access token regenerated via new flow for {user}")
+                    
+                    # Save the new tokens
                     if cred_path:
                         save_cred = raw_cred if nested else cred
                         if nested:
                             save_cred['fyers']['fyers_access_token'] = access_token
-                            refresh_token = token_response.get("refresh_token")
                             if refresh_token:
                                 save_cred['fyers']['refresh_token'] = refresh_token
                         else:
                             save_cred['fyers_access_token'] = access_token
-                            refresh_token = token_response.get("refresh_token")
                             if refresh_token:
                                 save_cred['refresh_token'] = refresh_token
                         with open(cred_path, 'w') as f:
                             yaml.dump(save_cred, f, default_flow_style=False)
                         log_message(f"[FYERS] New access token saved to {cred_path} for {user}")
-                    else:
-                        log_message(f"[FYERS] Could not find cred file to save token for {user}")
-
+                    
                     # Try login with new token
                     try:
                         ret = api.login(app_id=app_id, access_token=access_token)
                         if ret and ret.get('stat') == 'Ok':
-                            log_message(f"[LOGIN OK] {user} (after manual token generation)")
+                            log_message(f"[LOGIN OK] {user} (after new flow token generation)")
                             return api
                     except Exception as e:
-                        log_message(f"[LOGIN EXCEPTION AFTER MANUAL] {user}: {e}")
+                        log_message(f"[LOGIN EXCEPTION AFTER NEW FLOW] {user}: {e}")
+                else:
+                    # Fall back to old refresh token method
+                    refreshed = self._refresh_access_token(cred, cred_path, app_id, secret_key, user)
+                    if refreshed:
+                        access_token = refreshed
+                        try:
+                            ret = api.login(app_id=app_id, access_token=access_token)
+                            if ret and ret.get('stat') == 'Ok':
+                                log_message(f"[LOGIN OK] {user} (after token refresh)")
+                                return api
+                        except Exception as e:
+                            log_message(f"[LOGIN EXCEPTION AFTER REFRESH] {user}: {e}")
+                    else:
+                        # Fall back to manual token generation
+                        log_message(f"[FYERS] Access token invalid for {user}, generating new one...")
+
+                        try:
+                            # Step 1: Get auth code automatically
+                            auth_code = get_auth_code_automated(app_id, secret_key, user)
+                            if not auth_code:
+                                log_message(f"[FYERS] Failed to get auth code for {user}")
+                                return None
+
+                            # Step 2: Generate access token
+                            session = fyersModel.SessionModel(
+                                client_id=app_id,
+                                secret_key=secret_key,
+                                grant_type="authorization_code"
+                            )
+                            session.set_token(auth_code)
+                            token_response = session.generate_token()
+
+                            if not token_response or token_response.get("s") != "ok":
+                                log_message(f"[FYERS] Token generation failed for {user}: {token_response}")
+                                return None
+
+                            access_token = token_response.get("access_token")
+                            if not access_token:
+                                log_message(f"[FYERS] No access_token in response for {user}")
+                                return None
+
+                            # Step 5: Save the new token to the YAML file
+                            if cred_path:
+                                save_cred = raw_cred if nested else cred
+                                if nested:
+                                    save_cred['fyers']['fyers_access_token'] = access_token
+                                    refresh_token = token_response.get("refresh_token")
+                                    if refresh_token:
+                                        save_cred['fyers']['refresh_token'] = refresh_token
+                                else:
+                                    save_cred['fyers_access_token'] = access_token
+                                    refresh_token = token_response.get("refresh_token")
+                                    if refresh_token:
+                                        save_cred['refresh_token'] = refresh_token
+                                with open(cred_path, 'w') as f:
+                                    yaml.dump(save_cred, f, default_flow_style=False)
+                                log_message(f"[FYERS] New access token saved to {cred_path} for {user}")
+                            else:
+                                log_message(f"[FYERS] Could not find cred file to save token for {user}")
+
+                            # Try login with new token
+                            try:
+                                ret = api.login(app_id=app_id, access_token=access_token)
+                                if ret and ret.get('stat') == 'Ok':
+                                    log_message(f"[LOGIN OK] {user} (after manual token generation)")
+                                    return api
+                            except Exception as e:
+                                log_message(f"[LOGIN EXCEPTION AFTER MANUAL] {user}: {e}")
+
+                        except Exception as e:
+                            log_message(f"[FYERS] Token generation error for {user}: {e}")
+                            return None
 
             log_message(f"[LOGIN FAIL] {user} - {ret}")
             return None
