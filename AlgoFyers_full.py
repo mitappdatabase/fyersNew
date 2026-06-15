@@ -1515,7 +1515,7 @@ class MultiAccountManager:
             log_message(f"[FYERS] Attempting token refresh for {user} using {cred_path}")
             import hashlib
             appIdHash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
-            url = "https://api-t1.fyers.in/api/v3/validate-refresh-token"
+            url = "https://api.fyers.in/api/v3/validate-refresh-token"
             payload = {
                 "grant_type": "refresh_token",
                 "appIdHash": appIdHash,
