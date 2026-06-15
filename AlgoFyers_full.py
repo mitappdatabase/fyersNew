@@ -927,7 +927,11 @@ class FyersApiAdapter:
                 if not token and symbol:
                     token = self._sym_to_token(symbol)
                 if token is None:
-                    return
+                    # For index symbols like NSE:NIFTY50-INDEX, use symbol directly as token
+                    if symbol and "INDEX" in symbol.upper():
+                        token = symbol
+                    else:
+                        return
                 if ltp is None:
                     return
                 
