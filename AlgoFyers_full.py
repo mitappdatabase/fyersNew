@@ -280,7 +280,7 @@ def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secr
     """
     try:
         # Step 1: Create pre-login payload
-        pre_login_url = "https://api-t1.fyers.in/api/v3/validate-pre-login"
+        pre_login_url = "https://api.fyers.in/api/v3/validate-pre-login"
         pre_login_payload = {
             "fy_id": app_id,
             "app_type": 2,
@@ -297,8 +297,15 @@ def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secr
             "Accept": "application/json"
         }
         
+        log_message(f"[FYERS] Sending pre-login request for {user}")
         response = requests.post(pre_login_url, json=pre_login_payload, headers=headers, timeout=15)
-        pre_login_data = response.json()
+        log_message(f"[FYERS] Pre-login response status: {response.status_code}, content: {response.text[:200]}")
+        
+        try:
+            pre_login_data = response.json()
+        except json.JSONDecodeError as e:
+            log_message(f"[FYERS] Invalid JSON in pre-login response: {e}. Response: {response.text}")
+            return None
         
         if pre_login_data.get("s") != "ok":
             log_message(f"[FYERS] Pre-login failed for {user}: {pre_login_data}")
@@ -316,7 +323,7 @@ def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secr
             log_message(f"[FYERS] Generated TOTP code for {user}")
         
         # Step 3: Send login request with TOTP
-        login_url = "https://api-t1.fyers.in/api/v3/validate-login"
+        login_url = "https://api.fyers.in/api/v3/validate-login"
         login_payload = {
             "request_key": request_key,
             "totp": totp_code,
@@ -324,22 +331,36 @@ def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secr
             "identifier": user  # This should be the registered phone number or email
         }
         
+        log_message(f"[FYERS] Sending login request for {user}")
         response = requests.post(login_url, json=login_payload, headers=headers, timeout=15)
-        login_data = response.json()
+        log_message(f"[FYERS] Login response status: {response.status_code}, content: {response.text[:200]}")
+        
+        try:
+            login_data = response.json()
+        except json.JSONDecodeError as e:
+            log_message(f"[FYERS] Invalid JSON in login response: {e}. Response: {response.text}")
+            return None
         
         if login_data.get("s") != "ok":
             log_message(f"[FYERS] Login failed for {user}: {login_data}")
             return None
         
         # Step 4: Generate auth code using the validated session
-        auth_code_url = "https://api-t1.fyers.in/api/v3/generate-auth-code"
+        auth_code_url = "https://api.fyers.in/api/v3/generate-auth-code"
         auth_code_payload = {
             "request_key": request_key,
             "redirect_uri": "http://127.0.0.1:5000/callback"
         }
         
+        log_message(f"[FYERS] Sending auth code request for {user}")
         response = requests.post(auth_code_url, json=auth_code_payload, headers=headers, timeout=15)
-        auth_code_data = response.json()
+        log_message(f"[FYERS] Auth code response status: {response.status_code}, content: {response.text[:200]}")
+        
+        try:
+            auth_code_data = response.json()
+        except json.JSONDecodeError as e:
+            log_message(f"[FYERS] Invalid JSON in auth code response: {e}. Response: {response.text}")
+            return None
         
         if auth_code_data.get("s") != "ok":
             log_message(f"[FYERS] Auth code generation failed for {user}: {auth_code_data}")
@@ -351,7 +372,7 @@ def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secr
             return None
         
         # Step 5: Exchange auth code for access token
-        token_url = "https://api-t1.fyers.in/api/v3/validate-authcode"
+        token_url = "https://api.fyers.in/api/v3/validate-authcode"
         token_payload = {
             "grant_type": "authorization_code",
             "appIdHash": hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest(),
@@ -359,8 +380,15 @@ def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secr
             "redirect_uri": "http://127.0.0.1:5000/callback"
         }
         
+        log_message(f"[FYERS] Sending token exchange request for {user}")
         response = requests.post(token_url, json=token_payload, headers=headers, timeout=15)
-        token_data = response.json()
+        log_message(f"[FYERS] Token response status: {response.status_code}, content: {response.text[:200]}")
+        
+        try:
+            token_data = response.json()
+        except json.JSONDecodeError as e:
+            log_message(f"[FYERS] Invalid JSON in token response: {e}. Response: {response.text}")
+            return None
         
         if token_data.get("s") != "ok":
             log_message(f"[FYERS] Token generation failed for {user}: {token_data}")
@@ -378,7 +406,8 @@ def get_access_token_new_flow(app_id: str, secret_key: str, user: str, totp_secr
             
     except Exception as e:
         log_message(f"[FYERS] New login flow error for {user}: {e}")
-        traceback.print_exc()
+        import traceback
+        log_message(f"[FYERS] Traceback: {traceback.format_exc()}")
         return None
 
 
