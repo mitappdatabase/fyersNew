@@ -1,4 +1,9 @@
 ```
-__pycache__/
-*.pyc
+# Environment variables
+.env
+.env.local
+*.env.*
+
+# Configuration files
+credentials.yml
 ```
